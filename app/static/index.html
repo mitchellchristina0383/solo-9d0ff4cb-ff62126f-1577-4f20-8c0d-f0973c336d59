@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事故诊断包上传 · 断点续传</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 960px; margin: 0 auto; padding: 16px; line-height: 1.5; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-bottom: 8px; }
+  section { border: 1px solid #8884; border-radius: 10px; padding: 16px; margin: 14px 0; }
+  button { padding: 6px 14px; border-radius: 6px; border: 1px solid #8888;
+           cursor: pointer; font-size: 0.95rem; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=text], input[type=number] { padding: 6px 8px; border-radius: 6px;
+           border: 1px solid #8888; width: 100%; margin: 3px 0; font-family: monospace; }
+  .mono { font-family: ui-monospace, monospace; font-size: .85rem; word-break: break-all; }
+  .muted { color: #888; font-size: .85rem; }
+  .badge { display: inline-block; padding: 1px 10px; border-radius: 999px;
+           font-size: .8rem; font-weight: 600; }
+  .st-uploading { background: #f0ad4e22; color: #b87a10; border: 1px solid #b87a1088; }
+  .st-published { background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3288; }
+  .st-failed    { background: #c6282822; color: #c62828; border: 1px solid #c6282888; }
+  .task { border: 1px solid #8884; border-radius: 8px; padding: 12px; margin: 10px 0; }
+  .bar { height: 8px; background: #8883; border-radius: 4px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; background: #2e7d32; width: 0; transition: width .2s; }
+  .grid { display: flex; flex-wrap: wrap; gap: 2px; margin: 6px 0; }
+  .cell { width: 12px; height: 12px; border-radius: 2px; background: #8884; }
+  .cell.got { background: #2e7d32; }
+  .msg { white-space: pre-wrap; font-size: .88rem; margin-top: 6px; }
+  .msg.err { color: #c62828; } .msg.ok { color: #2e7d32; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  a.dl { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>事故诊断包上传（1 MiB 分块 · 断点续传 · 校验后发布）</h1>
+<p class="muted">创建任务时提交文件大小与 SHA-256；分块上传，刷新或重开页面后可查看已收分块并补齐；
+提交完成时服务端核对分块、总大小与摘要，全部通过才开放下载。摘要不符将拒绝发布，需重新创建任务。</p>
+
+<section>
+  <h2>1. 选择文件并创建任务</h2>
+  <input type="file" id="fileInput">
+  <div id="fileInfo" class="mono muted"></div>
+  <div class="row">
+    <button id="createBtn" disabled>创建任务并上传</button>
+    <span id="createMsg" class="msg"></span>
+  </div>
+</section>
+
+<section>
+  <h2>手动创建任务（已知大小与 SHA-256）</h2>
+  <input type="text" id="mName" placeholder="文件名，例如 diag-bundle.tar.gz">
+  <input type="number" id="mSize" placeholder="文件大小（字节）" min="0">
+  <input type="text" id="mSha" placeholder="SHA-256（64 位十六进制）">
+  <div class="row">
+    <button id="mCreate">创建空任务</button>
+    <span id="mMsg" class="msg"></span>
+  </div>
+</section>
+
+<section>
+  <h2>任务列表</h2>
+  <div class="row"><button id="refreshBtn">刷新</button><span class="muted">重开页面后在此查看各任务已收分块，选择同一文件即可补齐。</span></div>
+  <div id="taskList"></div>
+</section>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+const fmtSize = n => n >= 1048576 ? (n/1048576).toFixed(2) + " MiB" : (n/1024).toFixed(1) + " KiB";
+
+let pickedFile = null, pickedSha = null;
+
+async function api(method, url, body) {
+  const opt = { method };
+  if (body !== undefined) {
+    if (body instanceof Blob) { opt.body = body; opt.headers = { "Content-Type": "application/octet-stream" }; }
+    else { opt.body = JSON.stringify(body); opt.headers = { "Content-Type": "application/json" }; }
+  }
+  const r = await fetch(url, opt);
+  let data = null;
+  try { data = await r.json(); } catch (e) { /* no body */ }
+  if (!r.ok) {
+    const err = new Error((data && (data.detail || data.error)) || ("HTTP " + r.status));
+    err.status = r.status; err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+async function putChunk(taskId, index, blob, attempts = 4) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await api("PUT", `/api/tasks/${taskId}/chunks/${index}`, blob);
+    } catch (e) {
+      if (e.status === 409 || e.status === 400) throw e;   // 内容冲突/参数错误：不重试
+      if (i === attempts - 1) throw e;                      // 网络/5xx：重试后放弃
+      await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+}
+
+$("fileInput").onchange = async () => {
+  pickedFile = $("fileInput").files[0] || null;
+  pickedSha = null; $("createBtn").disabled = true;
+  if (!pickedFile) { $("fileInfo").textContent = ""; return; }
+  $("fileInfo").textContent = "正在计算 SHA-256 …";
+  const buf = await pickedFile.arrayBuffer();
+  pickedSha = hexOf(await crypto.subtle.digest("SHA-256", buf));
+  $("fileInfo").textContent =
+    `${pickedFile.name} · ${pickedFile.size} 字节 (${fmtSize(pickedFile.size)})\nSHA-256: ${pickedSha}`;
+  $("createBtn").disabled = false;
+};
+
+$("createBtn").onclick = async () => {
+  if (!pickedFile || !pickedSha) return;
+  $("createBtn").disabled = true;
+  try {
+    const t = await api("POST", "/api/tasks",
+      { filename: pickedFile.name, size: pickedFile.size, sha256: pickedSha });
+    $("createMsg").textContent = "任务已创建: " + t.task_id;
+    await refreshTasks();
+    await uploadMissing(t.task_id, pickedFile);
+  } catch (e) {
+    $("createMsg").textContent = "创建失败: " + e.message;
+  } finally {
+    $("createBtn").disabled = false;
+  }
+};
+
+$("mCreate").onclick = async () => {
+  const filename = $("mName").value.trim();
+  const size = Number($("mSize").value);
+  const sha256 = $("mSha").value.trim();
+  try {
+    const t = await api("POST", "/api/tasks", { filename, size, sha256 });
+    $("mMsg").textContent = "已创建: " + t.task_id;
+    await refreshTasks();
+  } catch (e) { $("mMsg").textContent = "创建失败: " + e.message; }
+};
+
+async function uploadMissing(taskId, file) {
+  const st = await api("GET", `/api/tasks/${taskId}`);
+  if (st.state !== "uploading") { await refreshTasks(); return; }
+  if (file.size !== st.size) {
+    alert(`所选文件大小 (${file.size}) 与任务声明 (${st.size}) 不一致，请选择正确的文件。`);
+    return;
+  }
+  const msgEl = document.querySelector(`#msg-${taskId}`);
+  const total = st.total_chunks;
+  let done = st.received_count;
+  for (const idx of st.missing_chunks) {
+    const start = idx * st.chunk_size;
+    const blob = file.slice(start, Math.min(start + st.chunk_size, file.size));
+    try {
+      await putChunk(taskId, idx, blob);
+    } catch (e) {
+      if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = `分块 ${idx} 上传失败: ${e.message}`; }
+      await refreshTasks();
+      return;
+    }
+    done++;
+    if (msgEl) { msgEl.className = "msg"; msgEl.textContent = `上传中… ${done}/${total}`; }
+    const cell = document.querySelector(`#cell-${taskId}-${idx}`);
+    if (cell) cell.classList.add("got");
+    const bar = document.querySelector(`#bar-${taskId}`);
+    if (bar) bar.style.width = (100 * done / Math.max(total, 1)) + "%";
+  }
+  await refreshTasks();
+}
+
+async function finalizeTask(taskId) {
+  const msgEl = document.querySelector(`#msg-${taskId}`);
+  try {
+    const r = await api("POST", `/api/tasks/${taskId}/finalize`);
+    if (msgEl) { msgEl.className = "msg ok"; msgEl.textContent = "已发布，可下载。"; }
+  } catch (e) {
+    const d = e.data || {};
+    let text = e.message;
+    if (d.state === "failed") text = "摘要不符，任务已拒绝发布。请核对文件后重新创建任务。";
+    else if (d.missing_chunks) text = `尚缺 ${d.missing_chunks.length} 个分块: [${d.missing_chunks.slice(0, 20).join(", ")}${d.missing_chunks.length > 20 ? " …" : ""}]，请补传后再提交。`;
+    if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = text; }
+  }
+  await refreshTasks();
+}
+
+function taskCard(t) {
+  const div = document.createElement("div");
+  div.className = "task";
+  const pct = t.total_chunks ? Math.round(100 * t.received_count / t.total_chunks) : 100;
+  div.innerHTML = `
+    <div><b>${t.filename}</b> · ${fmtSize(t.size)}
+      <span class="badge st-${t.state}">${{uploading:"上传中",published:"已发布",failed:"已拒绝"}[t.state]}</span></div>
+    <div class="mono muted">id: ${t.task_id}<br>sha256: ${t.sha256}</div>
+    <div class="bar"><div id="bar-${t.task_id}" style="width:${pct}%"></div></div>
+    <div class="muted">分块 ${t.received_count}/${t.total_chunks}</div>
+    <div class="grid" id="grid-${t.task_id}"></div>
+    <div class="row">
+      ${t.state === "uploading" ? `
+        <label>选择文件续传 <input type="file" id="re-${t.task_id}" style="display:none"></label>
+        <button id="fin-${t.task_id}">提交完成</button>` : ""}
+      ${t.state === "published" ? `<a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${t.filename}</a>` : ""}
+      ${t.state === "failed" ? `<span class="msg err">摘要校验未通过，已拒绝发布，请重新创建任务。</span>` : ""}
+    </div>
+    <div class="msg" id="msg-${t.task_id}"></div>`;
+  if (t.state === "uploading") {
+    div.querySelector(`#re-${t.task_id}`).onchange = ev => {
+      const f = ev.target.files[0];
+      if (f) uploadMissing(t.task_id, f);
+    };
+    div.querySelector(`#fin-${t.task_id}`).onclick = () => finalizeTask(t.task_id);
+  }
+  return div;
+}
+
+async function refreshTasks() {
+  const list = $("taskList");
+  list.textContent = "加载中…";
+  try {
+    const { tasks } = await api("GET", "/api/tasks");
+    list.textContent = tasks.length ? "" : "暂无任务。";
+    for (const t of tasks) {
+      const card = taskCard(t);
+      list.appendChild(card);
+      if (t.total_chunks <= 2048) {
+        const st = await api("GET", `/api/tasks/${t.task_id}`);
+        const grid = card.querySelector(`#grid-${t.task_id}`);
+        const got = new Set(st.received_chunks);
+        for (let i = 0; i < st.total_chunks; i++) {
+          const c = document.createElement("div");
+          c.className = "cell" + (got.has(i) ? " got" : "");
+          c.id = `cell-${t.task_id}-${i}`;
+          c.title = `分块 ${i}` + (got.has(i) ? "（已收）" : "（缺失）");
+          grid.appendChild(c);
+        }
+      }
+    }
+  } catch (e) {
+    list.textContent = "加载失败: " + e.message;
+  }
+}
+
+$("refreshBtn").onclick = refreshTasks;
+refreshTasks();
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+services:
+  uploader:
+    build: .
+    image: incident-uploader
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - uploader-data:/data
+    restart: unless-stopped
+
+volumes:
+  uploader-data:
